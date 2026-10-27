@@ -12,17 +12,35 @@ MAX_PASSWORD_ATTEMPTS = 5
 LOCKOUT_SECONDS = 15 * 60
 
 _registered: set[int] | None = None  # кэш telegram_id из листа Users
+_admins: set[int] = set()  # кэш админов, назначенных из бота (колонка is_admin листа Users)
 _failed: dict[int, tuple[int, float]] = {}  # telegram_id -> (неудачных попыток подряд, заблокирован до)
 
 
-def is_admin(telegram_id: int) -> bool:
+async def _ensure_loaded() -> None:
+    global _registered, _admins
+    if _registered is None:
+        users = await excel_store.list_users()
+        _registered = {u["telegram_id"] for u in users}
+        _admins = {u["telegram_id"] for u in users if u["is_admin"]}
+
+
+def reset_cache() -> None:
+    """Таблицу пользователей поменял админ — перечитать при следующем обращении."""
+    global _registered
+    _registered = None
+
+
+def is_env_admin(telegram_id: int) -> bool:
     return telegram_id in config.ADMIN_TELEGRAM_IDS
 
 
+def is_admin(telegram_id: int) -> bool:
+    # Кэш _admins гарантированно загружен: любое событие сначала проходит AccessMiddleware
+    return is_env_admin(telegram_id) or telegram_id in _admins
+
+
 async def is_registered(telegram_id: int) -> bool:
-    global _registered
-    if _registered is None:
-        _registered = set(await excel_store.list_user_ids())
+    await _ensure_loaded()
     return telegram_id in _registered
 
 
@@ -62,6 +80,7 @@ class AccessMiddleware(BaseMiddleware):
         event: TelegramObject,
         data: dict[str, Any],
     ) -> Any:
+        await _ensure_loaded()
         user = data.get("event_from_user")
         if user is not None and (is_admin(user.id) or await is_registered(user.id)):
             return await handler(event, data)

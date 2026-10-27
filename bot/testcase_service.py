@@ -2,10 +2,9 @@ import io
 
 from openpyxl import load_workbook
 
-from .campaigns import CAMPAIGNS
+from . import campaigns
 
 REQUIRED_COLUMNS = ["test_plan", "order", "description", "campaign"]
-VALID_CAMPAIGN_TITLES = {c.title for c in CAMPAIGNS.values()}
 
 
 def parse_testcases_file(buf: io.BytesIO) -> tuple[list[dict], list[str]]:
@@ -26,6 +25,7 @@ def parse_testcases_file(buf: io.BytesIO) -> tuple[list[dict], list[str]]:
     if missing:
         return [], [f"В файле не хватает колонок: {', '.join(missing)}"]
 
+    valid_titles = {c.title for c in campaigns.all_campaigns()}
     rows: list[dict] = []
     errors: list[str] = []
 
@@ -42,8 +42,8 @@ def parse_testcases_file(buf: io.BytesIO) -> tuple[list[dict], list[str]]:
         if not test_plan or not description or not campaign:
             errors.append(f"Строка {r}: не заполнены test_plan/description/campaign")
             continue
-        if campaign not in VALID_CAMPAIGN_TITLES:
-            valid = ", ".join(sorted(VALID_CAMPAIGN_TITLES))
+        if campaign not in valid_titles:
+            valid = ", ".join(sorted(valid_titles))
             errors.append(f"Строка {r}: неизвестный сценарий «{campaign}» (допустимо: {valid})")
             continue
 

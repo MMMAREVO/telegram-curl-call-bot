@@ -12,13 +12,10 @@ class CallResult:
     error: Optional[str] = None
 
 
-async def trigger_call(base_url: str, campaign_id: str, phone: str, params: dict) -> CallResult:
-    url = f"{base_url}/campaigns/{campaign_id}/calls"
-    payload = {"number": phone, "params": params}
-
+async def trigger_call(url: str, headers: dict[str, str], body: dict) -> CallResult:
     try:
         async with httpx.AsyncClient(timeout=15) as client:
-            resp = await client.post(url, json=payload)
+            resp = await client.post(url, json=body, headers=headers)
     except httpx.RequestError as exc:
         return CallResult(ok=False, error=f"не удалось выполнить запрос: {exc}")
 

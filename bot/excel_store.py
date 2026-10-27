@@ -49,7 +49,9 @@ def append_row(sheet: Worksheet, values: list) -> None:
         _as_text_if_formula(cell, value)
 
 
-USERS_HEADER = ["telegram_id", "name", "phone", "registered_at"]
+USERS_HEADER = ["telegram_id", "name", "phone", "registered_at", "is_admin"]
+# Так в колонке is_admin помечается админ, назначенный из бота
+ADMIN_MARK = "да"
 CALLS_HEADER = [
     "timestamp", "telegram_id", "name", "phone", "campaign",
     "params", "status", "error", "sid", "call_result", "log", "log_file",
@@ -71,12 +73,12 @@ TESTCASES_HEADER = ["test_plan", "order", "description", "campaign"]
 TESTPROGRESS_HEADER = ["telegram_id", "test_plan", "current_index", "updated_at"]
 
 
-def _migrate_calls_header(sheet: Worksheet) -> None:
+def _migrate_header(sheet: Worksheet, full_header: list[str]) -> None:
     """Дописывает недостающие колонки в конец существующего заголовка, никогда не
     переставляя и не удаляя то, что там уже есть — иначе разъедутся старые строки."""
     existing = {sheet.cell(row=1, column=i).value for i in range(1, sheet.max_column + 1)}
     next_col = sheet.max_column + 1
-    for header in CALLS_HEADER:
+    for header in full_header:
         if header not in existing:
             sheet.cell(row=1, column=next_col, value=header)
             next_col += 1
@@ -86,7 +88,8 @@ def _open_workbook() -> Workbook:
     path = Path(config.EXCEL_PATH)
     if path.exists():
         wb = load_workbook(path)
-        _migrate_calls_header(wb["Calls"])
+        _migrate_header(wb["Calls"], CALLS_HEADER)
+        _migrate_header(wb["Users"], USERS_HEADER)
         if "Rounds" not in wb.sheetnames:
             rounds_sheet = wb.create_sheet("Rounds")
             rounds_sheet.append(ROUNDS_HEADER)
@@ -163,6 +166,78 @@ def _register_user_sync(telegram_id: int, name: str, phone: str) -> None:
 async def register_user(telegram_id: int, name: str, phone: str) -> None:
     async with _lock:
         await asyncio.to_thread(_register_user_sync, telegram_id, name, phone)
+
+
+def _user_record(sheet: Worksheet, row: int) -> dict:
+    record = {h: sheet.cell(row=row, column=i + 1).value for i, h in enumerate(USERS_HEADER)}
+    record["phone"] = str(record["phone"] or "")
+    record["is_admin"] = bool(record["is_admin"])
+    return record
+
+
+def _list_users_sync() -> list[dict]:
+    sheet = _open_workbook()["Users"]
+    return [
+        _user_record(sheet, row) for row in range(2, sheet.max_row + 1)
+        if sheet.cell(row=row, column=1).value is not None
+    ]
+
+
+async def list_users() -> list[dict]:
+    """Все пользователи: telegram_id, name, phone, registered_at, is_admin (bool)."""
+    async with _lock:
+        return await asyncio.to_thread(_list_users_sync)
+
+
+def _update_user_sync(telegram_id: int, fields: dict) -> bool:
+    wb = _open_workbook()
+    sheet = wb["Users"]
+    row = _find_user_row(sheet, telegram_id)
+    if row is None:
+        return False
+    for key, value in fields.items():
+        if key == "is_admin":
+            value = ADMIN_MARK if value else ""
+        set_cell(sheet, row, USERS_HEADER.index(key) + 1, value)
+    _save_with_retry(wb)
+    return True
+
+
+async def update_user(telegram_id: int, **fields) -> bool:
+    """Меняет name / phone / is_admin пользователя. False — такого пользователя нет."""
+    async with _lock:
+        return await asyncio.to_thread(_update_user_sync, telegram_id, fields)
+
+
+def _delete_user_sync(telegram_id: int) -> bool:
+    wb = _open_workbook()
+    removed = _delete_rows_where(wb["Users"], lambda v: v[0] == telegram_id)
+    _save_with_retry(wb)
+    return removed > 0
+
+
+async def delete_user(telegram_id: int) -> bool:
+    async with _lock:
+        return await asyncio.to_thread(_delete_user_sync, telegram_id)
+
+
+def _replace_users_sync(users: list[dict]) -> int:
+    wb = _open_workbook()
+    sheet = wb["Users"]
+    if sheet.max_row > 1:
+        sheet.delete_rows(2, sheet.max_row - 1)
+    for user in users:
+        values = {**user, "is_admin": ADMIN_MARK if user.get("is_admin") else ""}
+        append_row(sheet, [values.get(col, "") for col in USERS_HEADER])
+    _save_with_retry(wb)
+    return len(users)
+
+
+async def replace_users(users: list[dict]) -> int:
+    """Полностью заменяет таблицу пользователей (загрузка исправленного Excel админом).
+    Возвращает, сколько пользователей записано."""
+    async with _lock:
+        return await asyncio.to_thread(_replace_users_sync, users)
 
 
 def _add_call_row_sync(fields: dict) -> int:
@@ -294,6 +369,70 @@ async def query_calls(
         return await asyncio.to_thread(_query_calls_sync, campaign_title, telegram_id, only_errors, round_filter)
 
 
+def _call_record(sheet: Worksheet, row: int) -> dict:
+    values = [sheet.cell(row=row, column=i + 1).value for i in range(len(CALLS_HEADER))]
+    return {**dict(zip(CALLS_HEADER, values)), "_row": row}
+
+
+def _find_calls_sync(
+    campaign_title: Optional[str], telegram_id: Optional[int], text: Optional[str], limit: int
+) -> list[dict]:
+    sheet = _open_workbook()["Calls"]
+    needle = (text or "").strip().lower()
+    found = []
+    for r in range(sheet.max_row, 1, -1):
+        record = _call_record(sheet, r)
+        if campaign_title is not None and record.get("campaign") != campaign_title:
+            continue
+        if telegram_id is not None and record.get("telegram_id") != telegram_id:
+            continue
+        if needle and not any(needle in str(record.get(k) or "").lower() for k in ("call_id", "sid")):
+            continue
+        found.append(record)
+        if len(found) >= limit:
+            break
+    return found
+
+
+async def find_calls(
+    campaign_title: Optional[str] = None, telegram_id: Optional[int] = None,
+    text: Optional[str] = None, limit: int = 30,
+) -> list[dict]:
+    """Звонки для просмотра логов, новые сверху. text ищется в call_id и sid.
+    У каждой записи есть _row — номер строки листа Calls (см. get_call)."""
+    async with _lock:
+        return await asyncio.to_thread(_find_calls_sync, campaign_title, telegram_id, text, limit)
+
+
+def _get_call_sync(row: int) -> Optional[dict]:
+    sheet = _open_workbook()["Calls"]
+    if not 2 <= row <= sheet.max_row:
+        return None
+    return _call_record(sheet, row)
+
+
+async def get_call(row: int) -> Optional[dict]:
+    async with _lock:
+        return await asyncio.to_thread(_get_call_sync, row)
+
+
+def _call_users_sync(campaign_title: str) -> list[tuple[int, str]]:
+    sheet = _open_workbook()["Calls"]
+    users: dict[int, str] = {}
+    for r in range(sheet.max_row, 1, -1):
+        record = _call_record(sheet, r)
+        tid = record.get("telegram_id")
+        if record.get("campaign") == campaign_title and tid is not None and tid not in users:
+            users[tid] = str(record.get("name") or tid)
+    return list(users.items())
+
+
+async def call_users(campaign_title: str) -> list[tuple[int, str]]:
+    """Кто звонил по кампании: (telegram_id, имя), недавние сверху."""
+    async with _lock:
+        return await asyncio.to_thread(_call_users_sync, campaign_title)
+
+
 # --- Тест-кейсы ---
 
 def _list_test_plans_sync() -> list[tuple[str, int]]:
@@ -333,6 +472,22 @@ def _get_test_plan_cases_sync(test_plan: str) -> list[dict]:
 async def get_test_plan_cases(test_plan: str) -> list[dict]:
     async with _lock:
         return await asyncio.to_thread(_get_test_plan_cases_sync, test_plan)
+
+
+def _all_test_cases_sync() -> list[dict]:
+    sheet = _open_workbook()["TestCases"]
+    rows = []
+    for row in range(2, sheet.max_row + 1):
+        values = [sheet.cell(row=row, column=i + 1).value for i in range(len(TESTCASES_HEADER))]
+        if values[0]:
+            rows.append(dict(zip(TESTCASES_HEADER, values)))
+    return rows
+
+
+async def all_test_cases() -> list[dict]:
+    """Все тест-кейсы всех планов в порядке листа — для выгрузки админу."""
+    async with _lock:
+        return await asyncio.to_thread(_all_test_cases_sync)
 
 
 def _replace_test_plan_cases_sync(rows: list[dict]) -> dict[str, int]:

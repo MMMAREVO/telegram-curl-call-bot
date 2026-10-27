@@ -15,15 +15,21 @@ if not ACCESS_PASSWORD:
 # aiogram будет ходить в Telegram через него.
 BOT_PROXY = os.getenv("BOT_PROXY") or os.getenv("HTTPS_PROXY") or os.getenv("HTTP_PROXY") or ""
 
+# Адрес API кампаний — нужен только при первом запуске, чтобы собрать курлы встроенных
+# кампаний. Дальше курлы целиком (с адресом) хранятся в CAMPAIGNS_PATH и правятся из бота.
 CAMPAIGNS_API_BASE = os.getenv("CAMPAIGNS_API_BASE", "")
+CAMPAIGNS_PATH = os.getenv("CAMPAIGNS_PATH", "campaigns.json")
 EXCEL_PATH = os.getenv("EXCEL_PATH", "bot_data.xlsx")
 LOGS_DIR = os.getenv("LOGS_DIR", "call_logs")
-# Узум авто: список "Марка Модель" и файл с прогрессом ротации по пользователям
+# Старый список "Марка Модель" для Узум авто: при первом запуске переносится в список
+# переменных кампании (brand/model)
 CAR_MODELS_PATH = os.getenv("CAR_MODELS_PATH", "model_marka.txt")
-CAR_ROTATION_PATH = os.getenv("CAR_ROTATION_PATH", "car_rotation.json")
+# Прогресс ротации строк списков переменных по пользователям
+VAR_ROTATION_PATH = os.getenv("VAR_ROTATION_PATH", "var_rotation.json")
 
-# Telegram ID администраторов (через запятую) — им доступна выгрузка данных всех
-# исполнителей; остальные видят в экспорте только свои звонки.
+# Telegram ID администраторов (через запятую) — им доступна админка и выгрузка данных всех
+# исполнителей; остальные видят в экспорте только свои звонки. Ещё админов можно назначить
+# из бота (колонка is_admin листа Users); админов из .env из бота снять нельзя.
 ADMIN_TELEGRAM_IDS = {
     int(x.strip()) for x in os.getenv("ADMIN_TELEGRAM_IDS", "").split(",") if x.strip()
 }

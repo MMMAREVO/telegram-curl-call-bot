@@ -20,24 +20,22 @@ from aiogram.types import (
 )
 
 from . import (
-    access, audio_pause, car_models, config, excel_store, export_service, latency, numbers_store, pause, pause_report,
-    testcase_service, vlogs_fetcher,
+    access, audio_pause, campaigns, config, excel_store, export_service, latency, numbers_store, pause, pause_report,
+    var_rotation, vlogs_fetcher,
 )
 from .api_client import trigger_call
 from .audio_fetcher import download_recording
 from .intent_annotator import annotate_transcript
-from .campaigns import CAMPAIGNS
 from .config import LogSource
+from .curl_parser import render_body
 from .logs_fetcher import fetch_call_log
+from .phone import validate_phone
 from .transcript_fetcher import CallOutcome, wait_for_call_outcome
 
 router = Router()
 # Незарегистрированным — только /start и регистрация (см. access.py)
 router.message.outer_middleware(access.AccessMiddleware())
 router.callback_query.outer_middleware(access.AccessMiddleware())
-
-PHONE_RE = re.compile(r"^\d{7,15}$")
-
 
 class Registration(StatesGroup):
     password = State()
@@ -49,11 +47,7 @@ class CommentState(StatesGroup):
     waiting = State()
 
 
-class AdminUpload(StatesGroup):
-    waiting_file = State()
-
-
-class CarInput(StatesGroup):
+class VarInput(StatesGroup):
     waiting = State()
 
 
@@ -64,12 +58,7 @@ def top_menu_kb(is_admin: bool = False) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="📊 Экспорт отчёта", callback_data="menu:export")],
     ]
     if is_admin:
-        buttons.append(
-            [InlineKeyboardButton(text="🆕 Новая кампания (админ)", callback_data="menu:new_campaign")]
-        )
-        buttons.append(
-            [InlineKeyboardButton(text="🗂 Тест-планы (админ)", callback_data="menu:testplans")]
-        )
+        buttons.append([InlineKeyboardButton(text="⚙️ Админка", callback_data="menu:admin")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
@@ -94,7 +83,7 @@ def comment_choice_kb() -> InlineKeyboardMarkup:
 def campaign_pick_kb(prefix: str) -> InlineKeyboardMarkup:
     buttons = [
         [InlineKeyboardButton(text=c.title, callback_data=f"{prefix}:{c.key}")]
-        for c in CAMPAIGNS.values()
+        for c in campaigns.all_campaigns()
     ]
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
@@ -173,29 +162,9 @@ async def registration_name(message: Message, state: FSMContext) -> None:
     await state.set_state(Registration.phone)
 
 
-def _validate_phone(raw: str) -> tuple[str | None, str | None]:
-    """Проверяет номер, введённый пользователем. Возвращает (номер, None) или (None, текст ошибки)."""
-    text = raw.strip()
-    if not text:
-        return None, "Номер пустой."
-    if " " in text or "\t" in text:
-        return None, "В номере не должно быть пробелов."
-    if "+" in text:
-        return None, "Номер вводится без плюса."
-    if not text.isdigit():
-        return None, "Номер должен состоять только из цифр (без скобок, дефисов и букв)."
-    if text.startswith("998") and len(text) != 12:
-        return None, f"Номер Узбекистана — 12 цифр (998 + 9 цифр), а введено {len(text)}."
-    if text.startswith("7") and len(text) != 11:
-        return None, f"Номер России — 11 цифр (7 + 10 цифр), а введено {len(text)}."
-    if not PHONE_RE.match(text):
-        return None, "Номер должен содержать от 7 до 15 цифр."
-    return text, None
-
-
 @router.message(Registration.phone)
 async def registration_phone(message: Message, state: FSMContext) -> None:
-    phone, error = _validate_phone(message.text or "")
+    phone, error = validate_phone(message.text or "")
     if error:
         await message.answer(f"❌ {error}\nВведите номер ещё раз, например 998901234567:")
         return
@@ -228,58 +197,89 @@ async def registration_phone(message: Message, state: FSMContext) -> None:
 @router.callback_query(F.data == "menu:call")
 async def menu_call(callback: CallbackQuery, state: FSMContext) -> None:
     await callback.answer()
+    if not campaigns.all_campaigns():
+        await callback.message.answer("Пока нет ни одной кампании — попросите админа добавить курл.")
+        return
     await callback.message.answer("Выберите сценарий:", reply_markup=campaign_pick_kb("campaign"))
 
 
 @router.callback_query(F.data.startswith("campaign:"))
 async def campaign_selected(callback: CallbackQuery, state: FSMContext) -> None:
     key = callback.data.split(":", 1)[1]
-    campaign = CAMPAIGNS.get(key)
+    campaign = campaigns.get(key)
     if campaign is None:
-        await callback.answer("Неизвестная кампания", show_alert=True)
+        await callback.answer("Кампания не найдена — возможно, админ её удалил", show_alert=True)
         return
 
     await state.update_data(campaign_key=key, extra_params={})
     await callback.answer()
-    if campaign.car_params:
-        kb = InlineKeyboardMarkup(
-            inline_keyboard=[
-                [InlineKeyboardButton(text="✍️ Ввести вручную", callback_data="car:manual")],
-                [InlineKeyboardButton(text="🎲 Из списка", callback_data="car:random")],
-            ]
-        )
-        await callback.message.answer("Марка и модель авто:", reply_markup=kb)
+    if not campaign.variables:
+        await run_campaign_call(callback.message, state)
         return
-    await run_campaign_call(callback.message, state)
+    if campaign.var_list_problem() is not None:
+        # Списка нет — остаётся только ввести значения вручную
+        await _ask_next_variable(callback.message, state, campaign, {})
+        return
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="✍️ Ввести вручную", callback_data="var:manual")],
+            [InlineKeyboardButton(text="🎲 Из списка", callback_data="var:random")],
+        ]
+    )
+    await callback.message.answer(f"Переменные: {', '.join(campaign.variables)}", reply_markup=kb)
 
 
-@router.callback_query(F.data == "car:random")
-async def car_random(callback: CallbackQuery, state: FSMContext) -> None:
+@router.callback_query(F.data == "var:random")
+async def var_random(callback: CallbackQuery, state: FSMContext) -> None:
     await callback.answer()
     await callback.message.edit_reply_markup(reply_markup=None)
-    # Пустые extra_params — _run_campaign_call сам возьмёт следующую модель из ротации
+    # Пустые extra_params — _run_campaign_call сам возьмёт следующую строку из ротации
     await state.update_data(extra_params={})
     await run_campaign_call(callback.message, state)
 
 
-@router.callback_query(F.data == "car:manual")
-async def car_manual(callback: CallbackQuery, state: FSMContext) -> None:
+@router.callback_query(F.data == "var:manual")
+async def var_manual(callback: CallbackQuery, state: FSMContext) -> None:
     await callback.answer()
     await callback.message.edit_reply_markup(reply_markup=None)
-    await state.set_state(CarInput.waiting)
-    await callback.message.answer("Введите марку и модель через пробел, например: Chevrolet Malibu")
-
-
-@router.message(CarInput.waiting)
-async def car_manual_input(message: Message, state: FSMContext) -> None:
-    car = car_models.parse_car(message.text or "")
-    if car is None:
-        await message.answer("❌ Нужны марка и модель через пробел, например: Chevrolet Malibu")
+    campaign = campaigns.get((await state.get_data()).get("campaign_key", ""))
+    if campaign is None:
+        await callback.message.answer("Кампания не найдена — выберите сценарий заново.")
         return
-    brand, model = car
-    await state.set_state(None)
-    await state.update_data(extra_params={"brand": brand, "model": model})
-    await run_campaign_call(message, state)
+    await _ask_next_variable(callback.message, state, campaign, {})
+
+
+async def _ask_next_variable(message: Message, state: FSMContext, campaign, values: dict) -> None:
+    """Спрашивает переменные кампании по одной; когда введены все — запускает звонок."""
+    remaining = [v for v in campaign.variables if v not in values]
+    if not remaining:
+        await state.set_state(None)
+        await state.update_data(extra_params=values)
+        await run_campaign_call(message, state)
+        return
+    await state.update_data(var_values=values)
+    await state.set_state(VarInput.waiting)
+    position = len(campaign.variables) - len(remaining) + 1
+    await message.answer(f"Введите значение {remaining[0]} ({position} из {len(campaign.variables)}):")
+
+
+@router.message(VarInput.waiting)
+async def var_manual_input(message: Message, state: FSMContext) -> None:
+    value = (message.text or "").strip()
+    if not value:
+        await message.answer("Значение не может быть пустым, введите ещё раз:")
+        return
+    data = await state.get_data()
+    campaign = campaigns.get(data.get("campaign_key", ""))
+    if campaign is None:
+        await state.set_state(None)
+        await message.answer("Кампания не найдена — возможно, админ её удалил. Выберите сценарий заново.")
+        return
+    values = data.get("var_values", {})
+    remaining = [v for v in campaign.variables if v not in values]
+    if remaining:
+        values = {**values, remaining[0]: value}
+    await _ask_next_variable(message, state, campaign, values)
 
 
 # telegram_id пользователей, у которых сейчас идёт звонок: одновременно — только один
@@ -300,29 +300,36 @@ async def run_campaign_call(message: Message, state: FSMContext) -> None:
 
 async def _run_campaign_call(message: Message, state: FSMContext) -> None:
     data = await state.get_data()
-    campaign = CAMPAIGNS[data["campaign_key"]]
-    extra_params = data.get("extra_params", {})
-    from_rotation = False
-    if campaign.car_params and "brand" not in extra_params:
-        try:
-            brand, model = car_models.peek_next(message.chat.id)
-        except car_models.CarModelsError as exc:
-            await message.answer(f"❌ Не удалось взять модель из списка: {exc}")
+    campaign = campaigns.get(data.get("campaign_key", ""))
+    if campaign is None:
+        await message.answer("❌ Кампания не найдена — возможно, админ её удалил.")
+        return
+    values = data.get("extra_params", {})
+    rotation_row = None
+    if any(v not in values for v in campaign.variables):
+        problem = campaign.var_list_problem()
+        if problem:
+            await message.answer(f"❌ Не удалось взять значения из списка: {problem}")
             return
-        extra_params = {**extra_params, "brand": brand, "model": model}
-        from_rotation = True
-    params = {**campaign.fixed_params, **extra_params}
-    if campaign.car_params:
-        await message.answer(f"🚗 Марка: {params['brand']}, модель: {params['model']}")
+        rotation_row, values = var_rotation.peek_next(message.chat.id, campaign)
+    if campaign.variables:
+        await message.answer("🧩 " + ", ".join(f"{v}: {values[v]}" for v in campaign.variables))
 
     user = await excel_store.get_user(message.chat.id)
+    if user is None:
+        await message.answer("Вас нет в списке пользователей — зарегистрируйтесь через /start.")
+        return
     phone = user["phone"]
     name = user["name"]
+
+    body = render_body(campaign.body, phone, values)
+    # В Excel пишем то, чем звонки отличаются друг от друга: params (или всё тело без номера)
+    params = body.get("params", {k: v for k, v in body.items() if k != "number"})
 
     round_number = await excel_store.ensure_round(campaign.key)
 
     call_started_at = dt.datetime.now(dt.timezone.utc) - dt.timedelta(seconds=5)
-    result = await trigger_call(config.CAMPAIGNS_API_BASE, campaign.campaign_id, phone, params)
+    result = await trigger_call(campaign.url, campaign.headers, body)
 
     test_case_desc = data.get("test_case_desc", "-")
     test_case_ctx = data.get("test_case_ctx")
@@ -341,8 +348,8 @@ async def _run_campaign_call(message: Message, state: FSMContext) -> None:
         await _finish_call_interaction(message, state, test_case_ctx, is_admin)
         return
 
-    if from_rotation:
-        car_models.commit(message.chat.id, params["brand"], params["model"])
+    if rotation_row is not None:
+        var_rotation.commit(message.chat.id, campaign, rotation_row)
 
     await message.answer(
         f"✅ Звонок успешно запущен на номер {phone}\nКампания: {campaign.title}\nsid: {result.sid}"
@@ -652,48 +659,6 @@ def _is_admin(telegram_id: int) -> bool:
     return access.is_admin(telegram_id)
 
 
-# --- Админ: создание нового раунда тестирования для сценария ---
-
-async def _start_new_campaign_flow(message: Message) -> None:
-    await message.answer(
-        "Для какого сценария завести новую кампанию (раунд тестирования)?",
-        reply_markup=campaign_pick_kb("newcamp"),
-    )
-
-
-@router.message(Command("new_campaign"))
-async def cmd_new_campaign(message: Message, state: FSMContext) -> None:
-    if not _is_admin(message.from_user.id):
-        await message.answer("Эта команда доступна только администратору.")
-        return
-    await _start_new_campaign_flow(message)
-
-
-@router.callback_query(F.data == "menu:new_campaign")
-async def menu_new_campaign(callback: CallbackQuery, state: FSMContext) -> None:
-    await callback.answer()
-    if not _is_admin(callback.from_user.id):
-        await callback.message.answer("Эта команда доступна только администратору.")
-        return
-    await _start_new_campaign_flow(callback.message)
-
-
-@router.callback_query(F.data.startswith("newcamp:"))
-async def new_campaign_selected(callback: CallbackQuery, state: FSMContext) -> None:
-    if not _is_admin(callback.from_user.id):
-        await callback.answer("Только для администратора", show_alert=True)
-        return
-    key = callback.data.split(":", 1)[1]
-    campaign = CAMPAIGNS[key]
-    await callback.answer()
-    await callback.message.edit_reply_markup(reply_markup=None)
-    new_round = await excel_store.create_new_round(campaign.key, callback.from_user.id)
-    await callback.message.answer(
-        f"Кампания «{campaign.title}»: создан раунд №{new_round}.\n"
-        "Все новые звонки по этому сценарию теперь относятся к этому раунду."
-    )
-
-
 # --- Экспорт ---
 
 async def _start_export_flow(user_id: int, message: Message, state: FSMContext) -> None:
@@ -719,7 +684,10 @@ async def menu_export(callback: CallbackQuery, state: FSMContext) -> None:
 @router.callback_query(F.data.startswith("expcamp:"))
 async def export_campaign_selected(callback: CallbackQuery, state: FSMContext) -> None:
     key = callback.data.split(":", 1)[1]
-    campaign = CAMPAIGNS[key]
+    campaign = campaigns.get(key)
+    if campaign is None:
+        await callback.answer("Кампания не найдена — возможно, админ её удалил", show_alert=True)
+        return
     await callback.answer()
     await callback.message.edit_reply_markup(reply_markup=None)
     data = await state.get_data()
@@ -751,7 +719,10 @@ async def export_scope_selected(callback: CallbackQuery, state: FSMContext) -> N
 
     data = await state.get_data()
     export_data = data.get("export", {})
-    campaign = CAMPAIGNS[export_data["campaign_key"]]
+    campaign = campaigns.get(export_data.get("campaign_key", ""))
+    if campaign is None:
+        await callback.message.answer("Кампания не найдена — начните выгрузку заново.")
+        return
     only_errors = export_data.get("only_errors", False)
 
     is_admin = _is_admin(callback.from_user.id)
@@ -808,165 +779,7 @@ async def _send_archive_parts(message: Message, archives: list[bytes], name: str
         )
 
 
-# --- Админ: управление тест-планами (загрузка / удаление) ---
-
-def testplans_admin_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="📥 Загрузить тест-план(ы)", callback_data="menu:upload_testcases")],
-            [InlineKeyboardButton(text="🗑 Удалить тест-план", callback_data="tpdel_list")],
-        ]
-    )
-
-
-@router.callback_query(F.data == "menu:testplans")
-async def menu_testplans(callback: CallbackQuery, state: FSMContext) -> None:
-    await callback.answer()
-    if not _is_admin(callback.from_user.id):
-        await callback.message.answer("Эта функция доступна только администратору.")
-        return
-    plans = await excel_store.list_test_plans()
-    if plans:
-        listing = "\n".join(f"• {name} — {count} кейсов" for name, count in plans)
-        text = f"Загруженные тест-планы:\n{listing}"
-    else:
-        text = "Пока нет ни одного загруженного тест-плана."
-    await callback.message.answer(text, reply_markup=testplans_admin_kb())
-
-
-@router.callback_query(F.data == "tpdel_list")
-async def testplan_delete_list(callback: CallbackQuery, state: FSMContext) -> None:
-    await callback.answer()
-    if not _is_admin(callback.from_user.id):
-        await callback.message.answer("Эта функция доступна только администратору.")
-        return
-    await callback.message.edit_reply_markup(reply_markup=None)
-    plans = await excel_store.list_test_plans()
-    if not plans:
-        await callback.message.answer("Удалять нечего — тест-планов нет.")
-        return
-    # В callback_data имя плана не влезет (лимит 64 байта), поэтому держим список в state и передаём индекс.
-    await state.update_data(del_test_plans=[name for name, _ in plans])
-    buttons = [
-        [InlineKeyboardButton(text=f"🗑 {name} ({count} кейсов)", callback_data=f"tpdel:{i}")]
-        for i, (name, count) in enumerate(plans)
-    ]
-    buttons.append([InlineKeyboardButton(text="↩️ Отмена", callback_data="tpdel_cancel")])
-    await callback.message.answer(
-        "Какой тест-план удалить?", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
-    )
-
-
-def _pending_delete_plan(data: dict, idx: int) -> str | None:
-    plans = data.get("del_test_plans", [])
-    return plans[idx] if 0 <= idx < len(plans) else None
-
-
-@router.callback_query(F.data.startswith("tpdel:"))
-async def testplan_delete_selected(callback: CallbackQuery, state: FSMContext) -> None:
-    await callback.answer()
-    if not _is_admin(callback.from_user.id):
-        return
-    await callback.message.edit_reply_markup(reply_markup=None)
-    idx = int(callback.data.split(":", 1)[1])
-    test_plan = _pending_delete_plan(await state.get_data(), idx)
-    if test_plan is None:
-        await callback.message.answer("Список устарел, откройте «Тест-планы» заново.")
-        return
-    kb = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="✅ Да, удалить", callback_data=f"tpdel_yes:{idx}")],
-            [InlineKeyboardButton(text="↩️ Отмена", callback_data="tpdel_cancel")],
-        ]
-    )
-    await callback.message.answer(
-        f"Удалить тест-план «{test_plan}» со всеми тест-кейсами и прогрессом исполнителей?",
-        reply_markup=kb,
-    )
-
-
-@router.callback_query(F.data.startswith("tpdel_yes:"))
-async def testplan_delete_confirmed(callback: CallbackQuery, state: FSMContext) -> None:
-    await callback.answer()
-    if not _is_admin(callback.from_user.id):
-        return
-    await callback.message.edit_reply_markup(reply_markup=None)
-    idx = int(callback.data.split(":", 1)[1])
-    test_plan = _pending_delete_plan(await state.get_data(), idx)
-    if test_plan is None:
-        await callback.message.answer("Список устарел, откройте «Тест-планы» заново.")
-        return
-    removed = await _safe_excel(callback.message, excel_store.delete_test_plan(test_plan))
-    await state.update_data(del_test_plans=None)
-    if removed is not None:
-        await callback.message.answer(f"Тест-план «{test_plan}» удалён ({removed} тест-кейсов).")
-    await callback.message.answer("Выберите действие:", reply_markup=top_menu_kb(True))
-
-
-@router.callback_query(F.data == "tpdel_cancel")
-async def testplan_delete_cancel(callback: CallbackQuery, state: FSMContext) -> None:
-    await callback.answer("Отменено")
-    await callback.message.edit_reply_markup(reply_markup=None)
-    await state.update_data(del_test_plans=None)
-    await callback.message.answer(
-        "Выберите действие:", reply_markup=top_menu_kb(_is_admin(callback.from_user.id))
-    )
-
-
-@router.callback_query(F.data == "menu:upload_testcases")
-async def menu_upload_testcases(callback: CallbackQuery, state: FSMContext) -> None:
-    await callback.answer()
-    if not _is_admin(callback.from_user.id):
-        await callback.message.answer("Эта функция доступна только администратору.")
-        return
-    await callback.message.answer(
-        "Отправьте Excel-файл (.xlsx) с тест-кейсами.\n\n"
-        "В одном файле может быть несколько тест-планов — разные значения в колонке test_plan. "
-        "План с уже существующим именем будет заменён, остальные планы не затрагиваются.\n\n"
-        "Столбцы: test_plan, order, description, campaign.\n"
-        "campaign должен точно совпадать с названием сценария в меню, например: "
-        + ", ".join(f"«{c.title}»" for c in CAMPAIGNS.values())
-    )
-    await state.set_state(AdminUpload.waiting_file)
-
-
-@router.message(AdminUpload.waiting_file, F.document)
-async def receive_testcases_file(message: Message, state: FSMContext) -> None:
-    await state.clear()
-    doc = message.document
-    if not doc.file_name or not doc.file_name.lower().endswith((".xlsx", ".xlsm")):
-        await message.answer("Нужен файл .xlsx. Откройте «Тест-планы» → «Загрузить» ещё раз и пришлите файл.")
-        return
-
-    buf = io.BytesIO()
-    await message.bot.download(doc, destination=buf)
-
-    rows, errors = testcase_service.parse_testcases_file(buf)
-    if errors:
-        await message.answer("В файле есть проблемы:\n" + "\n".join(f"• {e}" for e in errors))
-        return
-
-    summary = await excel_store.replace_test_plan_cases(rows)
-    lines = [f"«{plan}»: {count} тест-кейс(ов)" for plan, count in summary.items()]
-    await message.answer(
-        "Загружено:\n" + "\n".join(lines),
-        reply_markup=top_menu_kb(_is_admin(message.from_user.id)),
-    )
-
-
-@router.message(AdminUpload.waiting_file)
-async def receive_testcases_file_wrong_type(message: Message, state: FSMContext) -> None:
-    await message.answer("Пришлите файл .xlsx как документ (не текстом и не фото).")
-
-
 # --- Тестирование по тест-кейсам ---
-
-def _campaign_key_by_title(title: str) -> str | None:
-    for c in CAMPAIGNS.values():
-        if c.title == title:
-            return c.key
-    return None
-
 
 @router.callback_query(F.data == "menu:testcases")
 async def menu_testcases(callback: CallbackQuery, state: FSMContext) -> None:
@@ -1013,8 +826,8 @@ async def _show_test_case(
         return
 
     case = cases[index]
-    campaign_key = _campaign_key_by_title(case["campaign"])
-    if campaign_key is None:
+    campaign = campaigns.by_title(case["campaign"])
+    if campaign is None:
         await message.answer(
             f"⚠️ Тест-кейс {index + 1}: сценарий «{case['campaign']}» не найден в текущем меню. "
             "Пропускаю, сообщите админу.",
@@ -1024,7 +837,7 @@ async def _show_test_case(
         return
 
     await state.update_data(
-        campaign_key=campaign_key, extra_params={}, test_case_desc=case["description"],
+        campaign_key=campaign.key, extra_params={}, test_case_desc=case["description"],
     )
     kb = InlineKeyboardMarkup(
         inline_keyboard=[[InlineKeyboardButton(text="☎️ Позвонить", callback_data="tc_call")]]
@@ -1041,6 +854,11 @@ async def tc_call(callback: CallbackQuery, state: FSMContext) -> None:
     await callback.message.edit_reply_markup(reply_markup=None)
     data = await state.get_data()
     await state.update_data(test_case_ctx={"test_plan": data["test_plan"], "index": data["tc_index"]})
+    campaign = campaigns.get(data.get("campaign_key", ""))
+    if campaign is not None and campaign.variables and campaign.var_list_problem() is not None:
+        # Списка переменных нет — значения спрашиваем вручную, иначе берутся из списка по кругу
+        await _ask_next_variable(callback.message, state, campaign, {})
+        return
     await run_campaign_call(callback.message, state)
 
 

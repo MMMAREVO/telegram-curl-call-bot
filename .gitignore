@@ -17,3 +17,7 @@ id_ed25519*
 .claude/
 
 car_rotation.json
+# Курлы кампаний (могут содержать токены в заголовках) и прогресс ротации переменных
+campaigns.json
+campaigns.json.tmp
+var_rotation.json
